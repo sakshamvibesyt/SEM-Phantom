@@ -2,6 +2,8 @@ import os
 import asyncio
 import logging
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pyrogram import Client, idle
 from convopyro import Conversation
@@ -31,6 +33,43 @@ logging.basicConfig(
 logger = logging.getLogger("userbot")
 
 print("Starting Userbot...")
+
+
+# Render Web Service health server.
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            body = b"SEM PHANTOM is running"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = b"Not Found"
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        # Keep routine health checks from filling the logs.
+        return
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="render-health-server",
+        daemon=True,
+    )
+    thread.start()
+    print(f"SEM PHANTOM health server listening on 0.0.0.0:{port}")
+    return server
+
 
 async def main():
     # Get session string from environment, or prompt when a human is attached.
@@ -72,39 +111,30 @@ async def main():
         session_string=session_string,
         plugins=dict(root="userbot")
     )
-    
+
     # Initialize conversation for userbot
     Conversation(userbot)
 
     try:
         # Start bot client if it was created. A bot failure (e.g. FLOOD_WAIT
-        # on auth.ImportBotAuthorization) must NOT take down the userbot — the
-        # bot client only powers inline/special-group features. Only a client
-        # that actually connected goes into apps["app"]: tools._BotProxy falls
-        # back to the userbot when it's absent, but a dead client parked there
-        # would defeat that fallback and raise ConnectionError instead.
+        # on auth.ImportBotAuthorization) must NOT take down the userbot.
         if app is not None:
             try:
                 await app.start()
                 apps["app"] = app
-                print(f"Bot started successfully!")
+                print("Bot started successfully!")
                 print(f"Bot logged in as: {app.me.first_name} (@{app.me.username})")
             except Exception as e:
                 print(f"Bot client failed to start (continuing without it): {e}")
 
-        # Start userbot client. Unlike the bot above, this client is the whole
-        # point of the process, so a failure here has to end it: exit non-zero
-        # rather than fall through to idle(). Idling with zero handlers looks
-        # perfectly healthy from outside -- the process is up and never exits --
-        # so compose's `restart: unless-stopped` never fires and the userbot
-        # stays silently down until somebody notices by hand.
+        # Start userbot client.
         try:
             await userbot.start()
         except Exception as e:
             print(f"Userbot client failed to start: {e}")
             raise SystemExit(1)
 
-        print(f"Userbot started successfully!")
+        print("Userbot started successfully!")
         print(f"Userbot logged in as: {userbot.me.first_name} (@{userbot.me.username})")
 
         # Add to clients dict for compatibility
@@ -115,21 +145,7 @@ async def main():
         if user_data and "sudoers" in user_data:
             SUDO[userbot.me.id] = user_data["sudoers"]
 
-        # Bring the voice-call client up here, alongside the pyrogram client it
-        # wraps, instead of on the first .play. PyTgCalls.start() checks the
-        # environment (ffmpeg, the ntgcalls native binding), installs its own
-        # mtproto update handler on this client and resolves our own peer -- work
-        # that has no business happening inside a command handler, where its
-        # latency lands on the user and a missing dependency shows up as a failed
-        # .play instead of a failed startup.
-        #
-        # config.songs_client is what the music commands read; nothing under
-        # userbot/ ever builds a call client. py-tgcalls invokes a handler as
-        # (call_py, update) and PyTgCalls exposes the pyrogram client it wraps as
-        # `mtproto_client`, so the callbacks need nothing bound in.
-        #
-        # Not fatal: everything except music works without it, so a failure here
-        # is a warning and the music commands say so when used.
+        # Start the voice-call client alongside the Pyrogram client.
         try:
             call_py = PyTgCalls(userbot)
             call_py.add_handler(stream_end_handler, STREAM_END_FILTER)
@@ -147,22 +163,19 @@ async def main():
         if loaded_extra_plugins:
             print(f"Loaded {len(loaded_extra_plugins)} extra plugin(s): {', '.join(loaded_extra_plugins)}")
 
-        # Build the WordSeek solver in a worker thread now, so no message
-        # handler has to. It indexes the whole word list (~0.3s of CPU), and it
-        # used to be built lazily inside auto_play_handler -- which runs for
-        # every outgoing group message -- stalling the event loop there.
-        # Referenced so the task is not garbage collected mid-flight.
+        # Build the WordSeek solver in a worker thread now.
         warmup_task = asyncio.create_task(warm_solver())
         background_tasks.add(warmup_task)
         warmup_task.add_done_callback(background_tasks.discard)
 
     except Exception as e:
-        # Reached only for the bookkeeping after a successful start (sudo list,
-        # extra plugins). Those are not worth refusing to run over -- the client
-        # is connected and its handlers are registered. SystemExit is a
-        # BaseException, so a failed start above passes straight through.
+        # Keep existing post-start error handling.
         print(f"Error after starting clients: {e}")
+
     await idle()
 
+
 if __name__ == "__main__":
+    # Start the HTTP listener before starting the Telegram clients.
+    start_health_server()
     asyncio.run(main())
